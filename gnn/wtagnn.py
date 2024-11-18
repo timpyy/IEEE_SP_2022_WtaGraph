@@ -40,15 +40,17 @@ class GATLayer(nn.Module):
             nn.init.constant_(self.bias, 0)
 
     def edge_attention(self, edges):
-        # Compute unnormalized attention scores for each head
-        el = (edges.src['z'] * self.attn_l).sum(dim=-1)  # Shape: (E, H)
-        er = (edges.dst['z'] * self.attn_r).sum(dim=-1)  # Shape: (E, H)
-        z_e = edges.data['z_e'].clone()  # Clone to avoid in-place conflicts
-        ee = (z_e * self.attn_e).sum(dim=-1)  # Use cloned tensor
+        """
+        Compute unnormalized attention scores for each head on the GPU.
+        """
+        # Perform batched matrix multiplications for better GPU utilization
+        el = th.matmul(edges.src['z'], self.attn_l.T)  # Shape: (E, H)
+        er = th.matmul(edges.dst['z'], self.attn_r.T)  # Shape: (E, H)
+        ee = th.matmul(edges.data['z_e'], self.attn_e.T)  # Shape: (E, H)
 
-        # Combine attention scores
+        # Combine attention scores and apply activation
         e = F.leaky_relu(el + er + ee)  # Shape: (E, H)
-        print(f"el shape: {el.shape}, er shape: {er.shape}, ee shape: {ee.shape}, e shape: {e.shape}")
+
         return {'e': e}
 
 
