@@ -2,6 +2,7 @@ import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class GATLayer(nn.Module):
     def __init__(self, in_feats_node, in_feats_edge, out_feats, num_heads=1, activation=None, dropout=0.0, bias=True):
         super(GATLayer, self).__init__()
@@ -14,104 +15,76 @@ class GATLayer(nn.Module):
 
         # Linear transformations for multi-head attention
         self.fc_node = nn.Linear(in_feats_node, out_feats * num_heads, bias=False)
-        self.fc_edge = nn.Linear(in_feats_edge, out_feats * num_heads, bias=False)  # Replaced MLP with a single linear layer
+        self.fc_edge = nn.Linear(in_feats_edge, out_feats * num_heads, bias=False)
 
         # Attention weights
         self.attn_l = nn.Parameter(th.FloatTensor(size=(num_heads, out_feats)))
         self.attn_r = nn.Parameter(th.FloatTensor(size=(num_heads, out_feats)))
         self.attn_e = nn.Parameter(th.FloatTensor(size=(num_heads, out_feats)))
 
-        # Learnable edge weights
-        self.edge_weights = nn.Parameter(th.Tensor(out_feats * num_heads, out_feats * num_heads))
-        nn.init.xavier_uniform_(self.edge_weights)
-
-        # Bias term
-        if bias:
-            self.bias = nn.Parameter(th.FloatTensor(size=(num_heads * out_feats,)))
-        else:
-            self.register_parameter('bias', None)
+        # Learnable neighbor attention matrix
+        self.neighbor_attention_matrix = nn.Parameter(th.Tensor(out_feats * num_heads, in_feats_edge))
+        nn.init.xavier_uniform_(self.neighbor_attention_matrix)
 
         self.reset_parameters()
 
     def reset_parameters(self):
         nn.init.xavier_normal_(self.fc_node.weight)
-        nn.init.xavier_normal_(self.fc_edge.weight)  # Updated initialization for the single linear layer
+        nn.init.xavier_normal_(self.fc_edge.weight)
         nn.init.xavier_normal_(self.attn_l)
         nn.init.xavier_normal_(self.attn_r)
         nn.init.xavier_normal_(self.attn_e)
-        nn.init.xavier_uniform_(self.edge_weights)
-        if self.bias is not None:
-            nn.init.constant_(self.bias, 0)
+        nn.init.xavier_uniform_(self.neighbor_attention_matrix)
 
-    def edge_attention(self, edges):
+    def edge_attention(self, edges, neighbor_edges):
         """
-        Computes unnormalized attention scores based on nodes and edge features.
+        Computes unnormalized attention scores based on nodes, edge, and neighbor edge features.
         """
-        # Compute attention from source and destination nodes
         el = (edges.src['z'] * self.attn_l).sum(dim=-1)  # (E, H)
         er = (edges.dst['z'] * self.attn_r).sum(dim=-1)  # (E, H)
 
-        # Transform edge features to align dimensions
         transformed_z_e = edges.data['z_e'].view(-1, self.out_feats * self.num_heads)
-
-        # Use learnable edge weights
-        weighted_z_e = transformed_z_e @ self.edge_weights.T
+        weighted_z_e = transformed_z_e @ self.neighbor_attention_matrix.T
         weighted_z_e = weighted_z_e.view(-1, self.num_heads, self.out_feats)
         ee = (weighted_z_e * self.attn_e).sum(dim=-1)  # (E, H)
 
-        # Aggregate attention scores
-        e = F.leaky_relu(el + er + ee)  # (E, H)
+        # Dynamically retrieve neighbor features
+        neighbor_contribution = neighbor_edges[edges.data[dgl.EID]].to(g.device)
+        neighbor_weights = self.neighbor_attention_matrix @ neighbor_contribution.T
+        neighbor_weights = neighbor_weights.T.view(-1, self.num_heads, self.out_feats)
+        neighbor_contribution = (neighbor_weights * self.attn_e).sum(dim=-1)  # (E, H)
 
+        e = F.leaky_relu(el + er + ee + neighbor_contribution)  # Combine all contributions
         return {'e': e}
 
-    def message_func(self, edges):
-        """
-        Sends messages along the edges during the message-passing phase.
-        """
-        return {'z': edges.src['z'], 'e': edges.data['e'], 'z_e': edges.data['z_e']}
+    def forward(self, g, nf, ef, neighbor_edges):
+        # Move neighbor_edges to the graph's device temporarily
+        neighbor_edges = neighbor_edges.to(g.device)
 
-    def reduce_func(self, nodes):
-        """
-        Reduces incoming messages at each node using attention scores.
-        """
-        alpha = F.softmax(nodes.mailbox['e'], dim=1)  # Compute attention weights
-        h = th.sum(alpha.unsqueeze(-1) * nodes.mailbox['z'], dim=1)  # Weighted sum of messages
-        return {'h': h}
-
-    def forward(self, g, nf, ef):
-        # Ensure ef has correct shape
         ef = ef.view(-1, self.in_feats_edge)
-
-        # Transform node and edge features
-        z = self.fc_node(nf).view(-1, self.num_heads, self.out_feats)  # Node features: [num_nodes, num_heads, out_feats]
-        z_e = self.fc_edge(ef).view(-1, self.num_heads, self.out_feats)  # Updated to use fc_edge
+        z = self.fc_node(nf).view(-1, self.num_heads, self.out_feats)
+        z_e = self.fc_edge(ef).view(-1, self.num_heads, self.out_feats)
 
         g.ndata['z'] = z
         g.edata['z_e'] = z_e
 
-        # Apply attention mechanism
-        g.apply_edges(self.edge_attention)
+        # Dynamically pass neighbor_edges to edge_attention
+        g.apply_edges(lambda edges: self.edge_attention(edges, neighbor_edges))
+
         g.update_all(self.message_func, self.reduce_func)
 
-        # Node and edge outputs
         n_out = g.ndata.pop('h').view(-1, self.num_heads * self.out_feats)
         e_out = g.edata.pop('z_e').view(-1, self.num_heads * self.out_feats)
+        return n_out, e_out
 
-        # Combine node and edge features
-        g.edata['z_e'] = e_out.view(-1, self.num_heads, self.out_feats)
-        g.apply_edges(lambda edges: {'fused': edges.src['z'] + edges.data['z_e']})
-        fused_out = g.edata.pop('fused')
+    def message_func(self, edges):
+        return {'z': edges.src['z'], 'e': edges.data['e'], 'z_e': edges.data['z_e']}
 
-        # Optional: Apply bias, activation, and dropout
-        if self.bias is not None:
-            reshaped_bias = self.bias.view(self.num_heads, self.out_feats).unsqueeze(0)  # Align dimensions
-            fused_out += reshaped_bias
-        if self.activation:
-            fused_out = self.activation(fused_out)
-        if self.dropout:
-            fused_out = self.dropout(fused_out)
+    def reduce_func(self, nodes):
+        alpha = F.softmax(nodes.mailbox['e'], dim=1)
+        h = th.sum(alpha.unsqueeze(-1) * nodes.mailbox['z'], dim=1)
+        return {'h': h}
 
-        return n_out, fused_out
 
 
 class WTAGNN(nn.Module):
@@ -132,16 +105,12 @@ class WTAGNN(nn.Module):
         self.edge_transform_layer = nn.Linear(n_classes, n_hidden * n_heads)  # Transform layer for edge features
         self.edge_out_layer = nn.Linear(n_hidden * n_heads, n_classes)
 
-    def forward(self, g, nf, ef):
-        """
-        Forward pass for the WTAGNN model.
-        Processes graph layers sequentially and computes outputs for nodes and edges.
-        """
+    def forward(self, g, nf, ef, neighbor_edges):
         for layer in self.layers:
-            nf, ef = layer(g, nf, ef)
+            nf, ef = layer(g, nf, ef, neighbor_edges)
 
         # Compute node logits and updated edge features
-        n_logits, ef = self.node_out_layer(g, nf, ef)
+        n_logits, ef = self.node_out_layer(g, nf, ef, neighbor_edges)
 
         # Transform edge features to match edge_out_layer input requirements
         ef = self.edge_transform_layer(ef.view(-1, ef.size(-1)))

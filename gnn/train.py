@@ -13,11 +13,12 @@ def start_train(args):
     th.autograd.set_detect_anomaly(True)
     gloader = GraphLoader()
     # Load graph and masks
-    g, nf, ef, e_label, train_mask, test_mask, val_mask = gloader.load_graph(args)
+    g, nf, ef, e_label, train_mask, test_mask, val_mask, neighbor_edges = gloader.load_graph(args)
 
     # Verify feature sizes
     print('Node feature size:', nf.shape)
     print('Edge feature size:', ef.shape)
+    print('Neighbor edge feature size:', neighbor_edges.shape)
 
     n_classes = 2
     input_node_feat_size = nf.shape[1]
@@ -42,6 +43,7 @@ def start_train(args):
         th.cuda.set_device(args.gpu)
         nf, ef, e_label = nf.cuda(), ef.cuda(), e_label.cuda()
         train_mask, val_mask, test_mask = train_mask.cuda(), val_mask.cuda(), test_mask.cuda()
+        # Keep neighbor_edges on CPU initially
         model.cuda()
 
     # Loss function and optimizer
@@ -56,10 +58,10 @@ def start_train(args):
         if epoch >= 3:
             t0 = time.time()
 
-        # Forward pass
-        n_logits, e_logits = model(g, nf, ef)
+        # Forward pass with neighbor_edges dynamically passed
+        n_logits, e_logits = model(g, nf, ef, neighbor_edges)
 
-        # Compute loss using train_mask
+        # Compute loss
         loss = loss_fcn(e_logits[train_mask], e_label[train_mask])
 
         optimizer.zero_grad()
@@ -98,7 +100,7 @@ def start_train(args):
 
 def start_train_cv(args):
     gloader = GraphLoader()
-    g, nf, ef, e_label, _, _, _ = gloader.load_graph(args)
+    g, nf, ef, e_label, _, _, _, neighbor_edges = gloader.load_graph(args)
 
     n_classes = 2
     input_node_feat_size, input_edge_feat_size = nf.shape[1], ef.shape[1]
@@ -144,14 +146,20 @@ def start_train_cv(args):
         loss_fcn = th.nn.CrossEntropyLoss()
         optimizer = th.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-        dur = [];
+        dur = []
         max_acc = -1
         for epoch in range(args.n_epochs):
             model.train()
-            if epoch >= 3: t0 = time.time()
+            if epoch >= 3:
+                t0 = time.time()
 
             # Forward pass
-            n_logits, e_logits = model(g, nf, ef)
+            if cuda:
+                neighbor_edges_gpu = neighbor_edges.cuda()
+            else:
+                neighbor_edges_gpu = neighbor_edges
+
+            n_logits, e_logits = model(g, nf, ef, neighbor_edges_gpu)
 
             # Compute loss
             loss = loss_fcn(e_logits[train_mask], e_label[train_mask])

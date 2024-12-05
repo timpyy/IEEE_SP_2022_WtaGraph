@@ -42,13 +42,13 @@ print(args)
 ### Mode 1: regular training 
 ### with the default args, you will train a model on the full graph
 
-#start_train(args)
+start_train(args)
 
 
 ### Mode 2: cross-validation training 
 ### with the default args, you will train a model on the full graph with 5 fold cv
 
-start_train_cv(args)
+#start_train_cv(args)
 
 
 
